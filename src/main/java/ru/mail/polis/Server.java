@@ -33,7 +33,7 @@ import java.nio.file.Path;
  * @author Vadim Tsesko
  */
 public final class Server {
-    private static final int PORT = 8080;
+    private static final int PORT = 8380;
 
     private static final Logger LOG = LoggerFactory.getLogger(Server.class);
 

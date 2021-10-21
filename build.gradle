@@ -37,7 +37,7 @@ dependencies {
 
 application {
     mainClass = 'ru.mail.polis.Server'
-    applicationDefaultJvmArgs = ['-Xmx128m']
+    applicationDefaultJvmArgs = ['-Xmx128m', '-Xlog:gc*']
 }
 
 test {

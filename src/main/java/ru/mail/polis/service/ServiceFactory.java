@@ -17,9 +17,12 @@
 package ru.mail.polis.service;
 
 import ru.mail.polis.lsm.DAO;
+import ru.mail.polis.service.artem_drozdov.BasicService;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
 /**
  * Constructs {@link Service} instances.
@@ -40,9 +43,7 @@ public final class ServiceFactory {
      * @param dao  DAO to store the data
      * @return a storage instance
      */
-    public static Service create(
-            final int port,
-            final DAO dao) throws IOException {
+    public static Service create(int port, DAO dao) throws IOException {
         if (Runtime.getRuntime().maxMemory() > MAX_HEAP) {
             throw new IllegalStateException("The heap is too big. Consider setting Xmx.");
         }
@@ -53,6 +54,6 @@ public final class ServiceFactory {
 
         Objects.requireNonNull(dao);
 
-        throw new UnsupportedOperationException("Implement me!");
+        return new BasicService(port, dao, Executors.newFixedThreadPool(16));
     }
 }
