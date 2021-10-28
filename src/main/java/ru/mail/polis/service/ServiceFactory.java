@@ -22,7 +22,6 @@ import ru.mail.polis.service.artem_drozdov.BasicService;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
 /**
@@ -31,7 +30,7 @@ import java.util.concurrent.Executors;
  * @author Vadim Tsesko
  */
 public final class ServiceFactory {
-    private static final long MAX_HEAP = 256 * 1024 * 1024;
+    private static final long MAX_HEAP = 512 * 1024 * 1024;
 
     private ServiceFactory() {
         // Not supposed to be instantiated
@@ -45,8 +44,7 @@ public final class ServiceFactory {
      * @param topology a list of all cluster endpoints {@code http://<host>:<port>} (including this one)
      * @return a storage instance
      */
-    public static Service create(int port, DAO dao,
-            final Set<String> topology) throws IOException {
+    public static Service create(int port, DAO dao, Set<String> topology) throws IOException {
         if (Runtime.getRuntime().maxMemory() > MAX_HEAP) {
             throw new IllegalStateException("The heap is too big. Consider setting Xmx.");
         }
@@ -61,6 +59,6 @@ public final class ServiceFactory {
             throw new IllegalArgumentException("Empty cluster");
         }
 
-        return new BasicService(port, dao, Executors.newFixedThreadPool(16));
+        return new BasicService(port, dao, topology);
     }
 }
