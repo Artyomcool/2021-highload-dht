@@ -39,6 +39,11 @@ public class LsmDAO implements DAO {
 
     @Override
     public Iterator<Record> range(@Nullable ByteBuffer fromKey, @Nullable ByteBuffer toKey) {
+        return range(fromKey, toKey, false);
+    }
+
+    @Override
+    public Iterator<Record> range(@Nullable ByteBuffer fromKey, @Nullable ByteBuffer toKey, boolean includeTombstones) {
 
         Storage storage = this.storage.get();
 
@@ -47,7 +52,7 @@ public class LsmDAO implements DAO {
 
         Iterator<Record> iterator = mergeTwo(new PeekingIterator(sstableRanges), new PeekingIterator(memoryRange));
 
-        return filterTombstones(iterator);
+        return includeTombstones ? iterator : filterTombstones(iterator);
     }
 
     @Override

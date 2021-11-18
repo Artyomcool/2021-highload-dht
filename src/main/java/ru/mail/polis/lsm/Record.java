@@ -24,18 +24,20 @@ public class Record {
 
     private final ByteBuffer key;
     private final ByteBuffer value;
+    private final long timestamp;
 
-    Record(ByteBuffer key, @Nullable ByteBuffer value) {
+    Record(ByteBuffer key, @Nullable ByteBuffer value, long timestamp) {
         this.key = key.asReadOnlyBuffer();
         this.value = value == null ? null : value.asReadOnlyBuffer();
+        this.timestamp = timestamp;
     }
 
-    public static Record of(ByteBuffer key, ByteBuffer value) {
-        return new Record(key.asReadOnlyBuffer(), value.asReadOnlyBuffer());
+    public static Record of(ByteBuffer key, ByteBuffer value, long timestamp) {
+        return new Record(key, value, timestamp);
     }
 
-    public static Record tombstone(ByteBuffer key) {
-        return new Record(key, null);
+    public static Record tombstone(ByteBuffer key, long timestamp) {
+        return new Record(key, null, timestamp);
     }
 
     public ByteBuffer getKey() {
@@ -58,4 +60,7 @@ public class Record {
         return value == null ? 0 : value.remaining();
     }
 
+    public long getTimestamp() {
+        return timestamp;
+    }
 }

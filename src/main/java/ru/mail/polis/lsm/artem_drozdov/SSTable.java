@@ -75,7 +75,7 @@ public class SSTable implements Closeable {
                 FileChannel fileChannel = openForWrite(tmpFileName);
                 FileChannel indexChannel = openForWrite(tmpIndexName)
         ) {
-            ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES + MAX_BUFFER_SIZE);
+            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES + MAX_BUFFER_SIZE);
             while (records.hasNext()) {
                 long position = fileChannel.position();
                 if (position > Integer.MAX_VALUE) {
@@ -84,7 +84,9 @@ public class SSTable implements Closeable {
                 writeInt((int) position, indexChannel, buffer);
 
                 Record record = records.next();
-                writeValueWithSize(record.getKey(), fileChannel, buffer);
+                writeValueWithSize(record.getKey(),fileChannel, buffer);
+
+                writeLong(record.getTimestamp(), fileChannel, buffer);
                 if (record.isTombstone()) {
                     writeInt(-1, fileChannel, buffer);
                 } else {
@@ -243,6 +245,15 @@ public class SSTable implements Closeable {
         channel.write(tmp);
     }
 
+    private static void writeLong(long value, WritableByteChannel channel, ByteBuffer tmp) throws IOException {
+        tmp.position(0);
+        tmp.putLong(value);
+        tmp.position(0);
+        tmp.limit(Long.BYTES);
+
+        channel.write(tmp);
+    }
+
     private static void rename(Path file, Path tmpFile) throws IOException {
         Files.deleteIfExists(file);
         Files.move(tmpFile, file, StandardCopyOption.ATOMIC_MOVE);
@@ -331,13 +342,15 @@ public class SSTable implements Closeable {
                 int keySize = buffer.getInt();
                 ByteBuffer key = read(keySize);
 
+                long timestamp = buffer.getLong();
                 int valueSize = buffer.getInt();
+
                 if (valueSize == -1) {
-                    return Record.tombstone(key);
+                    return Record.tombstone(key, timestamp);
                 }
                 ByteBuffer value = read(valueSize);
 
-                return Record.of(key, value);
+                return Record.of(key, value, timestamp);
             }
 
             private ByteBuffer read(int size) {
