@@ -16,7 +16,9 @@
 
 package ru.mail.polis.service;
 
+import one.nio.http.Response;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 
@@ -209,6 +211,7 @@ class ThreeNodeTest extends ClusterTestBase {
             final String key = randomId();
 
             for (int node = 0; node < getClusterSize(); node++) {
+                LoggerFactory.getLogger(getClass()).debug("Node {}", node);
                 // Reinitialize
                 restartAllNodes();
 
@@ -221,8 +224,12 @@ class ThreeNodeTest extends ClusterTestBase {
                 // Help implementors with ms precision for conflict resolution
                 waitForVersionAdvancement();
 
+                LoggerFactory.getLogger(getClass()).debug("Starting request {}", node);
                 // Delete
-                assertEquals(202, delete((node + 1) % getClusterSize(), key, 2, 3).getStatus());
+                Response delete = delete((node + 1) % getClusterSize(), key, 2, 3);
+                assertEquals(202, delete.getStatus());
+
+                LoggerFactory.getLogger(getClass()).debug("Request finished {}", node);
 
                 // Start node
                 createAndStart(node);

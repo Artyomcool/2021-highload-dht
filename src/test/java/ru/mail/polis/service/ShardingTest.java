@@ -16,7 +16,9 @@
 
 package ru.mail.polis.service;
 
+import one.nio.http.Response;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 
@@ -181,8 +183,8 @@ class ShardingTest extends ClusterTestBase {
             final byte[] value = randomValue();
 
             // Insert
-            assertEquals(201, upsert(0, key, value, 1, 1).getStatus());
-            assertEquals(201, upsert(1, key, value, 1, 1).getStatus());
+            upsertIntoNode(0, key, value);
+            upsertIntoNode(1, key, value);
 
             // Stop all
             for (int node = 0; node < getClusterSize(); node++) {
@@ -195,6 +197,8 @@ class ShardingTest extends ClusterTestBase {
                 // Start node
                 createAndStart(node);
 
+                LoggerFactory.getLogger(ShardingTest.class).debug("Node {}", node);
+
                 // Check
                 if (get(node, key, 1, 1).getStatus() == 200) {
                     copies++;
@@ -205,5 +209,11 @@ class ShardingTest extends ClusterTestBase {
             }
             assertEquals(1, copies);
         });
+    }
+
+    private void upsertIntoNode(int node, String key, byte[] value) throws Exception {
+        LoggerFactory.getLogger(ShardingTest.class).debug("Upsert into node {}", node);
+        Response result = upsert(node, key, value, 1, 1);
+        assertEquals(201, result.getStatus());
     }
 }

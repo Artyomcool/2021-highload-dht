@@ -1,6 +1,5 @@
 package ru.mail.polis.service.artem_drozdov;
 
-import one.nio.http.HttpClient;
 import one.nio.http.HttpException;
 import one.nio.http.HttpServer;
 import one.nio.http.HttpServerConfig;
@@ -10,7 +9,6 @@ import one.nio.http.Path;
 import one.nio.http.Request;
 import one.nio.http.RequestMethod;
 import one.nio.http.Response;
-import one.nio.net.ConnectionString;
 import one.nio.pool.PoolException;
 import one.nio.server.AcceptorConfig;
 import one.nio.util.Hash;
@@ -23,61 +21,62 @@ import ru.mail.polis.service.Service;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.Function;
 
 public class BasicService extends HttpServer implements Service {
 
-    public static final String INTERNAL_REQUEST_HEADER = "X-Internal-Request: MySecretKey";
-    public static final String TIMESTAMP_HEADER = "X-Entity-Timestamp: ";
+    // FIXME parse headers
+    public static final String INTERNAL_REQUEST_HEADER = "X-Internal-Request";
+    public static final String INTERNAL_REQUEST_HEADER_VALUE = "MySecretKey";
+    public static final String INTERNAL_REQUEST_CHECK = INTERNAL_REQUEST_HEADER + ": " + INTERNAL_REQUEST_HEADER_VALUE;
+    public static final String TIMESTAMP_HEADER = "X-Entity-Timestamp";
+    public static final String TIMESTAMP_HEADER_FOR_READ = TIMESTAMP_HEADER + ": ";
 
-    private static final int TIMEOUT = 1000;  // TODO config
     private static final Logger log = LoggerFactory.getLogger(BasicService.class); // TODO use lookup
     private final DAO dao;
     private final Executor executor;
     private final List<String> topology;
-    private final Map<String, HttpClient> clients;
+    private final String self;
+
+    private final Executor httpExecutor = new ForkJoinPool(16);
+    private final HttpClient client;
+
 
     public BasicService(int port, DAO dao, Set<String> topology) throws IOException {
         super(from(port));
         this.dao = dao;
         this.executor = Executors.newFixedThreadPool(16);
         this.topology = new ArrayList<>(topology);
-        this.clients = extractSelfFromInterface(port, topology);
+        this.self = extractSelf(port, topology);
         Collections.sort(this.topology);
-    }
 
-    private static Map<String, HttpClient> extractSelfFromInterface(int port, Set<String> topology) throws UnknownHostException {
-        // own addresses
-        Map<String, HttpClient> clients = new HashMap<>();
-        List<InetAddress> allMe = Arrays.asList(InetAddress.getAllByName(null));
-
-        for (String node : topology) {
-            ConnectionString connection = new ConnectionString(node);
-
-            List<InetAddress> nodeAddresses = new ArrayList<>(Arrays.asList(
-                    InetAddress.getAllByName(connection.getHost()))
-            ); // TODO optimize
-            nodeAddresses.retainAll(allMe);
-
-            if (nodeAddresses.isEmpty() || connection.getPort() != port) {
-                clients.put(node, new HttpClient(connection));
-            }
-        }
-        return clients;
+        client = HttpClient.newBuilder()
+                .executor(httpExecutor)
+                .version(HttpClient.Version.HTTP_1_1)
+                .build();    // TODO configure
     }
 
     private static HttpServerConfig from(int port) {
@@ -89,19 +88,31 @@ public class BasicService extends HttpServer implements Service {
         return config;
     }
 
+    private static String extractSelf(int selfPort, Collection<String> topology) {
+        for (String option : topology) {
+            try {
+                int port = new URI(option).getPort();
+                if (port == selfPort) {
+                    return option;
+                }
+            } catch (URISyntaxException e) {
+                throw new IllegalArgumentException("Wrong url", e);
+            }
+        }
+        throw new IllegalArgumentException("Unknown port " + selfPort);
+    }
+
     @Path("/v0/status")
     @RequestMethod(Request.METHOD_GET)
     public Response status() {
         return Response.ok("I'm OK");
     }
 
-    private Response mergeForExpectedCode(List<Response> responses, int expectedCode, int ackCount, String answer) {
+    private Response mergeForExpectedCode(List<RemoteData> responses, int expectedCode, int ackCount, String answer) {
         log.info("ackCount: {}", ackCount);
 
-        for (Response response : responses) {
-            if (response.getStatus() != expectedCode) {
-                log.info("wrongStatus: {}", response.getHeader(INTERNAL_REQUEST_HEADER));
-                // TODO some metrics?
+        for (RemoteData response : responses) {
+            if (response.status != expectedCode) {
                 continue;
             }
 
@@ -115,41 +126,35 @@ public class BasicService extends HttpServer implements Service {
         return new Response(Response.GATEWAY_TIMEOUT, Response.EMPTY);
     }
 
-    private Response selectBetterValue(Response previous, Response candidate) {
-        if (previous == null || previous.getBody() == null) {
+    private RemoteData selectBetterValue(RemoteData previous, RemoteData candidate) {
+        if (previous == null || previous.data == null) {
             return candidate;
         }
 
-        if (candidate.getBody() == null) {
+        if (candidate.data == null) {
             return previous;
         }
 
-        return Arrays.compare(previous.getBody(), candidate.getBody()) > 0
+        return Arrays.compare(previous.data, candidate.data) > 0
                 ? candidate
                 : previous;
     }
 
-    private long extractTimestamp(Response response) {
-        String header = response.getHeader(TIMESTAMP_HEADER);
-        log.info("header {}", header);
-        return header == null ? Long.MIN_VALUE : Long.parseLong(header);
-    }
-
     private long extractTimestamp(Request request) {
-        String header = request.getHeader(TIMESTAMP_HEADER);
+        String header = request.getHeader(TIMESTAMP_HEADER_FOR_READ);
         return header == null ? Long.MIN_VALUE : Long.parseLong(header);
     }
 
-    private Response mergeForTimestamp(List<Response> responses, int ackCount) {
-        Response best = null;
+    private Response mergeForTimestamp(List<RemoteData> responses, int ackCount) {
+        RemoteData best = null;
         long bestTimestamp = Long.MIN_VALUE;
-        for (Response response : responses) {
-            switch (response.getStatus()) {
+        for (RemoteData response : responses) {
+            switch (response.status) {
                 case HttpURLConnection.HTTP_OK:
                 case HttpURLConnection.HTTP_NOT_FOUND:
                     ackCount--;
 
-                    long candidateTimestamp = extractTimestamp(response);
+                    long candidateTimestamp = response.timestamp == null ? Long.MIN_VALUE : response.timestamp;
                     log.info("timestamp merge {}/{}", bestTimestamp, candidateTimestamp);
                     if (candidateTimestamp == bestTimestamp) {
                         best = selectBetterValue(best, response);
@@ -159,6 +164,7 @@ public class BasicService extends HttpServer implements Service {
                     }
                     break;
                 default:
+                    ///??
             }
         }
 
@@ -166,63 +172,7 @@ public class BasicService extends HttpServer implements Service {
             return new Response(Response.GATEWAY_TIMEOUT, Response.EMPTY);
         }
 
-        return best;
-    }
-
-    private Task taskForMethod(String id, Request request, boolean internal, long timestamp) {
-        switch (request.getMethod()) {
-            case Request.METHOD_GET:
-                return new Task() {
-                    @Override
-                    public Response invokeOnLocalStorage() {
-                        return get(id, internal);
-                    }
-
-                    @Override
-                    public Response mergeCollectedResults(List<Response> responses, int ackCount) {
-                        return mergeForTimestamp(responses, ackCount);
-                    }
-                };
-            case Request.METHOD_PUT:
-                return new Task() {
-                    @Override
-                    public Response invokeOnLocalStorage() {
-                        log.info("invokeOnLocalStorage");
-                        Response put = put(id, request.getBody(), timestamp);
-                        log.info("invokeOnLocalStorageEnd {}", put.getStatus());
-                        return put;
-                    }
-
-                    @Override
-                    public Response mergeCollectedResults(List<Response> responses, int ackCount) {
-                        return mergeForExpectedCode(
-                                responses,
-                                HttpURLConnection.HTTP_CREATED,
-                                ackCount,
-                                Response.CREATED
-                        );
-                    }
-                };
-            case Request.METHOD_DELETE:
-                return new Task() {
-                    @Override
-                    public Response invokeOnLocalStorage() {
-                        return delete(id, timestamp);
-                    }
-
-                    @Override
-                    public Response mergeCollectedResults(List<Response> responses, int ackCount) {
-                        return mergeForExpectedCode(
-                                responses,
-                                HttpURLConnection.HTTP_ACCEPTED,
-                                ackCount,
-                                Response.ACCEPTED
-                        );
-                    }
-                };
-            default:
-                return null;
-        }
+        return toResponse(best);
     }
 
     @Path("/v0/entity")
@@ -232,19 +182,45 @@ public class BasicService extends HttpServer implements Service {
             @Param(value = "id", required = true) String id,
             @Param(value = "replicas") String replicas
     ) {
-        boolean internal ="".equals(request.getHeader(INTERNAL_REQUEST_HEADER));
-        log.info("Invoke: {}/{}", request.getHeader(INTERNAL_REQUEST_HEADER), internal);
-        long timestamp;
-        if (internal) {
-            timestamp = extractTimestamp(request);
-        } else {
-            timestamp = System.currentTimeMillis();
-            request.addHeader(TIMESTAMP_HEADER + timestamp);
-        }
-        log.info("entity {}/{}", request, timestamp);
-        Task task = taskForMethod(id, request, internal, timestamp);
 
-        execute(id, replicas, request, session, task, internal);
+        if (id.isEmpty()) {
+            log.warn("Id is empty");
+            sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes("Id is empty")));
+            return;
+        }
+
+        Context context;
+        try {
+            context = new Context(request, id, replicas);
+        } catch (UnsupportedOperationException e) {
+            log.warn("Wrong method", e);
+            sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes("Wrong method")));
+            return;
+        } catch (IllegalArgumentException e) {
+            log.warn("Wrong argument", e);
+            sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes("Wrong arguments")));
+            return;
+        }
+
+        execute(session, context);
+    }
+
+    private Replicas extractReplicas(String replicas) {
+        if (replicas == null) {
+            int from = topology.size();
+            int ack = from / 2 + 1;
+            return new Replicas(ack, from);
+        }
+
+        String[] parsed = replicas.split("/");
+        int ack = Integer.parseInt(parsed[0]);
+        int from = Integer.parseInt(parsed[1]);
+
+        if (ack <= 0 || ack > from || from > topology.size()) {
+            throw new IllegalArgumentException("Replicas wrong");
+        }
+
+        return new Replicas(ack, from);
     }
 
     @Override
@@ -255,22 +231,19 @@ public class BasicService extends HttpServer implements Service {
     @Override
     public synchronized void stop() {
         super.stop();
-        for (HttpClient client : clients.values()) {
-            client.close();
-        }
     }
 
-    private Response delete(String id, long timestamp) {
+    private RemoteData delete(String id, long timestamp) {
         ByteBuffer key = ByteBuffer.wrap(Utf8.toBytes(id));
         dao.upsert(Record.tombstone(key, timestamp));
-        return new Response(Response.ACCEPTED, Response.EMPTY);
+        return new RemoteData(202, Response.EMPTY, null);
     }
 
-    private Response put(String id, byte[] body, long timestamp) {
+    private RemoteData upsert(String id, byte[] body, long timestamp) {
         ByteBuffer key = ByteBuffer.wrap(Utf8.toBytes(id));
         ByteBuffer value = ByteBuffer.wrap(body);
         dao.upsert(Record.of(key, value, timestamp));
-        return new Response(Response.CREATED, Response.EMPTY);
+        return new RemoteData(201, Response.EMPTY, null);
     }
 
     private static byte[] extractBytes(ByteBuffer buffer) {
@@ -279,44 +252,34 @@ public class BasicService extends HttpServer implements Service {
         return result;
     }
 
-    private Response okForGet(Record record, boolean includeTimestamp) {
-        Response response;
+    private RemoteData okForGet(Record record) {
         if (record.isTombstone()) {
-            response = new Response(Response.NOT_FOUND, Response.EMPTY);
-        } else {
-            response = new Response(Response.OK, extractBytes(record.getValue()));
+            return new RemoteData(404, null, record.getTimestamp());
         }
-
-        if (includeTimestamp) {
-            response.addHeader(TIMESTAMP_HEADER + record.getTimestamp());
-        }
-
-        return response;
+        return new RemoteData(
+                200,
+                extractBytes(record.getValue()),
+                record.getTimestamp()
+        );
     }
 
-    private Response get(String id, boolean internal) {
+    private RemoteData get(String id) {
         ByteBuffer key = ByteBuffer.wrap(Utf8.toBytes(id));
-        Iterator<Record> range = dao.range(key, DAO.nextKey(key), internal);
+        Iterator<Record> range = dao.range(key, DAO.nextKey(key), true);
         if (range.hasNext()) {
-            return okForGet(range.next(), internal);
+            return okForGet(range.next());
         } else {
-            return new Response(Response.NOT_FOUND, Response.EMPTY);
+            return new RemoteData(404, null, null);
         }
     }
 
-    private List<Node> forKey(String id, int nodeCount) {
+    private List<Node> collectNodesForKey(String id, int nodeCount) {
         PriorityQueue<Node> nodes = new PriorityQueue<>(Comparator.comparingInt(o -> o.hash));
 
         for (String option : topology) {
             int hash = Hash.murmur3(option + id);
 
-            HttpClient client = clients.get(option);
-            Node node;
-            if (client == null) {   // it is our local node
-                node = createLocalNode(hash);
-            } else {
-                node = createRemoteNode(hash, client);
-            }
+            Node node = new Node(hash, option.equals(self) ? null : option);
             nodes.add(node);
 
             if (nodes.size() > nodeCount) {
@@ -327,108 +290,346 @@ public class BasicService extends HttpServer implements Service {
         return new ArrayList<>(nodes);
     }
 
-    private Node createLocalNode(int hash) {
-        return new Node(hash) {
-            @Override
-            Response invoke(Request request, Task task) {
-                return task.invokeOnLocalStorage();
-            }
-        };
-    }
-
-    private Node createRemoteNode(int hash, HttpClient client) {
-        return new Node(hash) {
-            @Override
-            Response invoke(Request request, Task task) throws InterruptedException {
-                try {
-                    return client.invoke(request, TIMEOUT);
-                } catch (HttpException | IOException | PoolException e) {
-                    log.debug("Invoke remote error", e);
-                    return new Response(Response.GATEWAY_TIMEOUT, Response.EMPTY);
-                }
-            }
-        };
-    }
-
-    private void execute(String id, String replicas, Request request, HttpSession session, Task task, boolean internal) {
-        if (task == null) {
-            sendResponse(session, new Response(Response.METHOD_NOT_ALLOWED, Utf8.toBytes("Wrong method")));
-            return;
-        }
-
+    private void execute(HttpSession session, Context context) {
         executor.execute(() -> {
+            CompletableFuture<Response> result;
 
-            Response result;
+            result = context.isCoordinator
+                    ? collectResponses(context)
+                    : toInternalResponse(invokeLocalRequest(context));
 
-            try {
-                result = invoke(id, replicas, request, task, internal);
-            } catch (Exception e) {
-                log.error("Unexpected exception during method call {}", request.getMethodName(), e);
-                sendResponse(session, new Response(Response.INTERNAL_ERROR, Utf8.toBytes("Something wrong")));
-                return;
-            }
-
-            sendResponse(session, result);
+            result.whenCompleteAsync((response, throwable) -> {
+                try {
+                    if (throwable != null) {
+                        throw throwable;
+                    }
+                    sendResponse(session, response);
+                } catch (RuntimeException | Error e) {
+                    log.error("Unexpected error", e);
+                    throw e;
+                } catch (Exception e) {
+                    log.error("Unexpected error", e);
+                } catch (Throwable e) {
+                    throw new Error(e);
+                }
+            }, executor);
         });
     }
 
-    private Response invoke(String id, String replicas, Request request, Task task, boolean internal) throws InterruptedException {
-        if (internal) {
-            // TODO validate if wrong id
-            return task.invokeOnLocalStorage();
-        }
-
-        int ack;
-        int from;
-        if (replicas != null) {
-            String[] parsed = replicas.split("/");
-            ack = Integer.parseInt(parsed[0]);
-            from = Integer.parseInt(parsed[1]);
-        } else {
-            from = topology.size();
-            ack = from / 2 + 1;
-        }
-
-        if (ack <= 0 || ack > from || id == null || id.equals("")) {
-            return new Response(Response.BAD_REQUEST, Response.EMPTY);
-        }
-
-        request.addHeader(INTERNAL_REQUEST_HEADER);
-        List<Node> nodes = forKey(id, from);
-        List<Response> responses = new ArrayList<>();
+    private CompletableFuture<Response> collectResponses(Context context) {
+        List<Node> nodes = collectNodesForKey(context.id, context.replicas.from);
+        List<CompletableFuture<RemoteData>> responses = new ArrayList<>();
         for (Node node : nodes) {
-            // TODO make it parallel
-            Response response = node.invoke(request, task);
-            log.info("invokeOnNode {}/{}", node.getClass(), response.getStatus());
-            responses.add(response);
+            if (node.isLocalNode()) {
+                log.info("Execute on local node");
+                responses.add(invokeLocalRequest(context));
+            } else {
+                try {
+                    log.info("Execute on from remote node");
+                    responses.add(invokeRemoteRequest(context, node));
+                } catch (HttpException | IOException | PoolException e) {
+                    log.warn("Exception during node communication", e);
+                }
+            }
         }
 
-        return task.mergeCollectedResults(responses, ack);
+        return merge(context, responses);
     }
 
-    private void sendResponse(HttpSession session, Response call) {
+    private CompletableFuture<RemoteData> invokeLocalRequest(Context context) {
+        return CompletableFuture.supplyAsync(() -> {
+            switch (context.operation) {
+                case GET:
+                    return get(context.id);
+                case UPSERT:
+                    return upsert(context.id, context.payload, context.timestamp);
+                case DELETE:
+                    return delete(context.id, context.timestamp);
+                default:
+                    throw new UnsupportedOperationException("Unsupported operation: " + context.operation);
+            }
+        }, Runnable::run); // TODO use async after profiling
+    }
+
+    private CompletableFuture<RemoteData> invokeRemoteRequest(Context context, Node node) throws HttpException, IOException, PoolException {
+        URI uri = URI.create(node.uri + "/v0/entity?id=" + context.id);
+        log.info("URI {}", uri);
+        switch (context.operation) {
+            case GET: {
+                HttpRequest request = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofMillis(1000))   // FIXME config
+                        .GET()
+                        .header(INTERNAL_REQUEST_HEADER, INTERNAL_REQUEST_HEADER_VALUE)
+                        .build();
+
+                CompletableFuture<HttpResponse<byte[]>> response =
+                        client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray());
+
+                return response.thenApply(httpResponse -> {
+                    String getTime = httpResponse.headers().firstValue(TIMESTAMP_HEADER).orElse(null);
+                    return new RemoteData(
+                            httpResponse.statusCode(),
+                            httpResponse.body(),
+                            getTime == null ? null : Long.valueOf(getTime)
+                    );
+                });
+            }
+
+            case UPSERT: {
+                HttpRequest put = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofMillis(1000))   // FIXME config
+                        .PUT(HttpRequest.BodyPublishers.ofByteArray(context.payload))
+                        .header(INTERNAL_REQUEST_HEADER, INTERNAL_REQUEST_HEADER_VALUE)
+                        .header(TIMESTAMP_HEADER, String.valueOf(context.timestamp))
+                        .build();
+
+                CompletableFuture<HttpResponse<Void>> response =
+                        client.sendAsync(put, HttpResponse.BodyHandlers.discarding());
+                return response.thenApply(httpResponse -> new RemoteData(
+                        httpResponse.statusCode(),
+                        null,
+                        null
+                ));
+            }
+            case DELETE: {
+                HttpRequest request = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofMillis(1000))   // FIXME config
+                        .DELETE()
+                        .header(INTERNAL_REQUEST_HEADER, INTERNAL_REQUEST_HEADER_VALUE)
+                        .header(TIMESTAMP_HEADER, String.valueOf(context.timestamp))
+                        .build();
+
+                CompletableFuture<HttpResponse<Void>> response =
+                        client.sendAsync(request, HttpResponse.BodyHandlers.discarding());
+                return response.thenApply(httpResponse -> new RemoteData(
+                        httpResponse.statusCode(),
+                        null,
+                        null
+                ));
+            }
+            default:
+                throw new UnsupportedOperationException("Unsupported operation: " + context.operation);
+        }
+    }
+
+    private CompletableFuture<Response> merge(Context context, List<CompletableFuture<RemoteData>> responses) {
+
+        CompletableFuture<Void> result = new CompletableFuture<>();
+
+        AtomicReferenceArray<RemoteData> unwrappedResponses = new AtomicReferenceArray<>(responses.size());
+        AtomicInteger acceptedCount = new AtomicInteger();
+        AtomicInteger acceptableErrorCount = new AtomicInteger(context.replicas.from - context.replicas.ack);
+
+        int index = 0;
+        for (CompletableFuture<RemoteData> response : responses) {
+            int current = (index++);
+            response.handleAsync((remoteData, throwable) -> {
+                log.debug("Response {}, {}", current, remoteData, throwable);
+                if (throwable != null) {
+                    try {
+                        throwable = throwable instanceof CompletionException ? throwable.getCause() : throwable;
+                        throw throwable;
+                    } catch (IOException e) {
+                        log.debug("Node unavailable: node", e); // TODO find way go understand what the node here
+                        if (acceptableErrorCount.getAndDecrement() == 0) {
+                            result.complete(null);
+                        }
+                        return null;
+                    } catch (Throwable e) {
+                        log.error("Unexpected error while waiting for result", e);
+                        result.completeExceptionally(e);
+                        return null;
+                    }
+                }
+
+                if (remoteData.status >= 500) {
+                    log.debug("Node unavailable: status {}, node {}", remoteData.status, remoteData.nodeName);
+                    if (acceptableErrorCount.getAndDecrement() == 0) {
+                        result.complete(null);
+                    }
+                    return null;
+                }
+
+                unwrappedResponses.set(current, remoteData);
+                int ack = context.replicas.ack;
+                if (acceptedCount.incrementAndGet() == ack) {
+                    result.complete(null);
+                }
+                return null;
+            }, executor).exceptionally(throwable -> {
+                // TODO why is suppressed exception here?
+                result.completeExceptionally(throwable);
+                return null;
+            });
+        }
+
+        return result.thenApplyAsync(unused -> {
+            if (acceptableErrorCount.get() < 0) {
+                return new Response(Response.GATEWAY_TIMEOUT, Response.EMPTY);
+            }
+
+            int ack = context.replicas.ack;
+            List<RemoteData> results = new ArrayList<>(ack);
+            for (int i = 0; i < unwrappedResponses.length(); i++) {
+                RemoteData data = unwrappedResponses.get(i);
+                if (data == null) {
+                    continue;
+                }
+
+                results.add(data);
+                if (results.size() == ack) {
+                    break;
+                }
+            }
+
+            return mergeSync(context, results);
+        }, executor);
+    }
+
+    private Response mergeSync(Context context, List<RemoteData> responses) {
+        switch (context.operation) {
+            case GET:
+                return mergeForTimestamp(responses, context.replicas.ack);
+            case UPSERT:
+                return mergeForExpectedCode(
+                        responses,
+                        HttpURLConnection.HTTP_CREATED,
+                        context.replicas.ack,
+                        Response.CREATED
+                );
+            case DELETE:
+                return mergeForExpectedCode(
+                        responses,
+                        HttpURLConnection.HTTP_ACCEPTED,
+                        context.replicas.ack,
+                        Response.ACCEPTED
+                );
+            default:
+                throw new UnsupportedOperationException("Unsupported operation: " + context.operation);
+        }
+    }
+
+    private String statusToString(int status) {
+        switch (status) {
+            case 200:
+                return Response.OK;
+            case 201:
+                return Response.CREATED;
+            case 202:
+                return Response.ACCEPTED;
+            case 404:
+                return Response.NOT_FOUND;
+        }
+        throw new IllegalArgumentException("Unknown status: " + status);
+    }
+
+    private void sendResponse(HttpSession session, Response response) {
         try {
-            session.sendResponse(call);
+            session.sendResponse(response);
         } catch (IOException e) {
             log.info("Can't send response", e);
         }
     }
 
-    private interface Task {
-        Response invokeOnLocalStorage();
-
-        Response mergeCollectedResults(List<Response> responses, int ackCount);
+    private Response toResponse(RemoteData data) {
+        return new Response(
+                statusToString(data.status),
+                data.data == null ? Response.EMPTY : data.data
+        );
     }
 
-    private abstract static class Node {
-        final int hash;
+    private CompletableFuture<Response> toInternalResponse(CompletableFuture<RemoteData> data) {
+        return data.thenApply(remoteData -> {
+            Response response = toResponse(remoteData);
+            if (remoteData.timestamp != null) {
+                response.addHeader(TIMESTAMP_HEADER_FOR_READ + remoteData.timestamp);
+            }
+            return response;
+        });
+    }
 
-        private Node(int hash) {
+    static class Node {
+        final int hash;
+        final String uri;
+
+        Node(int hash, String uri) {
             this.hash = hash;
+            this.uri = uri;
         }
 
-        abstract Response invoke(Request request, Task task) throws InterruptedException;
+        boolean isLocalNode() {
+            return uri == null;
+        }
+    }
 
+    private class Context {
+        final String id;
+        final boolean isCoordinator;
+        final long timestamp;
+        final byte[] payload;
+        final Operation operation;
+        final String uri;
+
+        final Replicas replicas;
+
+        Context(Request request, String id, String replicas) {
+            this.id = id;
+
+            this.isCoordinator = !"".equals(request.getHeader(INTERNAL_REQUEST_CHECK));
+            this.timestamp = isCoordinator
+                    ? System.currentTimeMillis()
+                    : extractTimestamp(request);
+            this.payload = request.getBody();
+            this.uri = request.getURI();
+
+            this.replicas = isCoordinator
+                    ? extractReplicas(replicas)
+                    : null;
+
+            switch (request.getMethod()) {
+                case Request.METHOD_GET:
+                    this.operation = Operation.GET;
+                    break;
+                case Request.METHOD_PUT:
+                    this.operation = Operation.UPSERT;
+                    break;
+                case Request.METHOD_DELETE:
+                    this.operation = Operation.DELETE;
+                    break;
+                default:
+                    throw new UnsupportedOperationException("Method " + request.getMethodName() + " is not supported");
+            }
+
+
+        }
+
+    }
+
+    private static class RemoteData {
+        final String nodeName = "unknown"; // FIXME provide node name
+        final int status;
+        final byte[] data;
+        final Long timestamp;
+
+        RemoteData(int status, byte[] data, Long timestamp) {
+            this.status = status;
+            this.data = data;
+            this.timestamp = timestamp;
+        }
+    }
+
+    private static class Replicas {
+        final int ack;
+        final int from;
+
+        Replicas(int ack, int from) {
+            this.ack = ack;
+            this.from = from;
+        }
+    }
+
+    private enum Operation {
+        GET, UPSERT, DELETE
     }
 
 }
