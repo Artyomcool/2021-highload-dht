@@ -9,8 +9,10 @@ import one.nio.http.Path;
 import one.nio.http.Request;
 import one.nio.http.RequestMethod;
 import one.nio.http.Response;
+import one.nio.net.Socket;
 import one.nio.pool.PoolException;
 import one.nio.server.AcceptorConfig;
+import one.nio.server.RejectedSessionException;
 import one.nio.util.Hash;
 import one.nio.util.Utf8;
 import org.slf4j.Logger;
@@ -27,6 +29,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -45,6 +48,7 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 public class BasicService extends HttpServer implements Service {
 
@@ -56,6 +60,7 @@ public class BasicService extends HttpServer implements Service {
     public static final String TIMESTAMP_HEADER_FOR_READ = TIMESTAMP_HEADER + ": ";
 
     private static final Logger log = LoggerFactory.getLogger(BasicService.class); // TODO use lookup
+    public static final byte[] NEXT_LINE = {(byte) '\n'};
     private final DAO dao;
     private final Executor executor;
     private final List<String> topology;
@@ -100,6 +105,93 @@ public class BasicService extends HttpServer implements Service {
             }
         }
         throw new IllegalArgumentException("Unknown port " + selfPort);
+    }
+
+    @Override
+    public HttpSession createSession(Socket socket) throws RejectedSessionException {
+        return new MyHttpSession(socket, this);
+    }
+
+    @Path("/v0/entities")
+    public void entities(
+            HttpSession session,
+            @Param(value = "start", required = true) String start,
+            @Param(value = "end") String end
+    ) {
+        if (start.isEmpty()) {
+            log.warn("Start is empty");
+            sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes("Start is empty")));
+            return;
+        }
+        MyHttpSession myHttpSession = (MyHttpSession) session;
+        Response response = new Response(Response.OK);
+        response.addHeader("Transfer-Encoding: chunked");
+        try {
+            ByteBuffer from = ByteBuffer.wrap(Utf8.toBytes(start));
+            ByteBuffer to = end == null || end.isEmpty() ? null : ByteBuffer.wrap(Utf8.toBytes(end));
+            Iterator<Record> range = dao.range(from, to, false);
+            myHttpSession.sendResponseWithSupplier(response, new Supplier<byte[]>() {
+                int state = 0;
+                Record current = null;
+                @Override
+                public byte[] get() {
+                    if (state == -1) {
+                        return null;
+                    }
+                    if (current == null) {
+                        if (!range.hasNext()) {
+                            state = -1;
+                            return "0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+                        }
+                        current = range.next();
+                    }
+                    state = (state + 1) % 5;
+                    switch (state) {
+                        case 1:
+                            int size = current.getKeySize() + 1 + current.getValueSize();
+                            String hex = String.format("%x\r\n", size);
+                            return hex.getBytes(StandardCharsets.US_ASCII);
+                        case 2:
+                            return extractBytes(current.getKey());
+                        case 3:
+                            // FIXME it looks like it is less effective than have local buffer
+                            return NEXT_LINE;
+                        case 4:
+                            return extractBytes(current.getValue());
+                        case 0:
+                            current = null;
+                            return "\r\n".getBytes(StandardCharsets.US_ASCII);
+                        default:
+                            throw new IllegalStateException();
+                    }
+                }
+            });
+        } catch (IOException e) {
+            log.warn("What?", e);   // TODO deal with it pls
+        }
+    }
+
+    @Path("/v0/natural")
+    public void natural(HttpSession session) {
+        MyHttpSession myHttpSession = (MyHttpSession) session;
+        Response response = new Response(Response.OK);
+        try {
+            myHttpSession.sendResponseWithSupplier(response, new Supplier<>() {
+                int current = 1;
+
+                @Override
+                public byte[] get() {
+                    String data = Integer.toHexString(current) + "\n";
+                    current++;
+                    if (current == 10000) {
+                        return null;
+                    }
+                    return data.getBytes(StandardCharsets.US_ASCII);
+                }
+            });
+        } catch (IOException e) {
+            log.warn("What?", e);   // TODO deal with it pls
+        }
     }
 
     @Path("/v0/status")
@@ -632,4 +724,46 @@ public class BasicService extends HttpServer implements Service {
         GET, UPSERT, DELETE
     }
 
+    private static class MyHttpSession extends HttpSession {
+
+        Supplier<byte[]> dataSupplier;
+
+        public MyHttpSession(Socket socket, HttpServer server) {
+            super(socket, server);
+        }
+
+        public void sendResponseWithSupplier(Response response, Supplier<byte[]> supplier) throws IOException {
+            this.dataSupplier = supplier;
+            response.setBody(supplier.get());
+            sendResponse(response);
+            processChain();
+        }
+
+        @Override
+        public synchronized void scheduleClose() {
+            if (dataSupplier == null) {
+                super.scheduleClose();
+            }
+        }
+
+        @Override
+        protected void processWrite() throws Exception {
+            super.processWrite();
+            processChain();
+        }
+
+        private void processChain() throws IOException {
+            if (dataSupplier != null) {
+                while (queueHead == null) {
+                    byte[] bytes = dataSupplier.get();
+                    if (bytes == null) {
+                        // TODO support keep-alive
+                        super.scheduleClose();
+                        return;
+                    }
+                    write(bytes, 0, bytes.length);
+                }
+            }
+        }
+    }
 }
